@@ -127,17 +127,33 @@ async fn handle_socket(
     }
 }
 
-/// HTTP代理处理器
+/// HTTP代理处理器 - 支持流式和非流式响应
 async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    axum::extract::Path(path): axum::extract::Path<String>,
     body: String,
-) -> Result<String, axum::http::StatusCode> {
+) -> Response {
     // 认证检查
-    let api_key = headers.get("x-goog-api-key").and_then(|h| h.to_str().ok());
+    let api_key = headers
+        .get("x-goog-api-key")
+        .and_then(|h| h.to_str().ok())
+        .or_else(|| {
+            // 也检查 query 参数
+            headers.get("x-original-uri").and_then(|uri| {
+                uri.to_str()
+                    .ok()
+                    .and_then(|s| s.split("key=").nth(1))
+                    .and_then(|s| s.split('&').next())
+            })
+        });
 
     if api_key != Some(&state.auth_api_key) {
-        return Err(axum::http::StatusCode::UNAUTHORIZED);
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            "Unauthorized: Invalid or missing API key",
+        )
+            .into_response();
     }
 
     let user_id = "user-1".to_string();
@@ -146,14 +162,26 @@ async fn proxy_handler(
     // 获取连接
     let connection = match state.connection_pool.get_connection(&user_id).await {
         Some(conn) => conn,
-        None => return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Service Unavailable: No active client connected",
+            )
+                .into_response()
+        }
     };
 
     // 创建响应通道
-    let (tx, mut rx) = mpsc::unbounded_channel::<WSMessage>();
+    let (tx, rx) = mpsc::unbounded_channel::<WSMessage>();
     state
         .connection_pool
         .register_pending_request(req_id.clone(), tx);
+
+    // 构建完整的目标 URL
+    let target_url = format!("https://generativelanguage.googleapis.com{}", path);
+
+    // 转换 headers，过滤代理特有的头
+    let forwarded_headers = filter_headers(&headers);
 
     // 构建请求消息
     let request_message = WSMessage {
@@ -161,54 +189,227 @@ async fn proxy_handler(
         r#type: "http_request".to_string(),
         payload: serde_json::json!({
             "method": "POST",
-            "url": "https://generativelanguage.googleapis.com/v1/models/gemini-pro:generate",
-            "headers": headers_to_json(&headers),
+            "url": target_url,
+            "headers": forwarded_headers,
             "body": body
         }),
     };
 
     // 发送请求
     if connection.send_message(request_message).await.is_err() {
-        return Err(axum::http::StatusCode::BAD_GATEWAY);
+        state.connection_pool.remove_pending_request(&req_id);
+        return (
+            axum::http::StatusCode::BAD_GATEWAY,
+            "Bad Gateway: Failed to send request to client",
+        )
+            .into_response();
     }
 
-    // 等待响应
+    // 处理响应（支持流式和非流式）
+    process_websocket_response(rx, req_id, state).await
+}
+
+/// 处理 WebSocket 响应，支持流式和非流式
+async fn process_websocket_response(
+    mut rx: mpsc::UnboundedReceiver<WSMessage>,
+    req_id: String,
+    state: Arc<AppState>,
+) -> Response {
+    use axum::response::sse::{Event, Sse};
+    use futures_util::stream;
+
     let timeout = tokio::time::sleep(PROXY_REQUEST_TIMEOUT);
+    tokio::pin!(timeout);
+
+    // 首先等待第一条消息以确定是流式还是非流式
     tokio::select! {
-        response = rx.recv() => {
-            if let Some(msg) = response {
-                match msg.r#type.as_str() {
-                    "http_response" => {
-                        if let Some(body) = msg.payload.get("body").and_then(|v| v.as_str()) {
-                            Ok(body.to_string())
-                        } else {
-                            Err(axum::http::StatusCode::BAD_GATEWAY)
+        first_msg = rx.recv() => {
+            match first_msg {
+                Some(msg) => {
+                    match msg.r#type.as_str() {
+                        "http_response" => {
+                            // 非流式响应
+                            state.connection_pool.remove_pending_request(&req_id);
+                            build_http_response(msg)
+                        }
+                        "stream_start" => {
+                            // 流式响应 - 创建 SSE stream
+                            info!("Starting SSE stream for request {}", req_id);
+
+                            let stream = stream::unfold(
+                                (rx, req_id.clone(), state.clone(), false),
+                                |(mut rx, req_id, state, mut ended)| async move {
+                                    if ended {
+                                        return None;
+                                    }
+
+                                    match rx.recv().await {
+                                        Some(msg) => match msg.r#type.as_str() {
+                                            "stream_chunk" => {
+                                                if let Some(data) = msg.payload.get("data").and_then(|v| v.as_str()) {
+                                                    Some((
+                                                        Ok::<_, std::convert::Infallible>(Event::default().data(data)),
+                                                        (rx, req_id, state, ended),
+                                                    ))
+                                                } else {
+                                                    Some((
+                                                        Ok(Event::default().data("")),
+                                                        (rx, req_id, state, ended),
+                                                    ))
+                                                }
+                                            }
+                                            "stream_end" => {
+                                                info!("Stream ended for request {}", req_id);
+                                                state.connection_pool.remove_pending_request(&req_id);
+                                                ended = true;
+                                                None
+                                            }
+                                            "error" => {
+                                                error!("Stream error for request {}: {:?}", req_id, msg.payload);
+                                                state.connection_pool.remove_pending_request(&req_id);
+                                                None
+                                            }
+                                            _ => {
+                                                warn!("Unexpected message type in stream: {}", msg.r#type);
+                                                Some((
+                                                    Ok(Event::default().data("")),
+                                                    (rx, req_id, state, ended),
+                                                ))
+                                            }
+                                        },
+                                        None => {
+                                            info!("Stream channel closed for request {}", req_id);
+                                            state.connection_pool.remove_pending_request(&req_id);
+                                            None
+                                        }
+                                    }
+                                },
+                            );
+
+                            Sse::new(stream).into_response()
+                        }
+                        "error" => {
+                            state.connection_pool.remove_pending_request(&req_id);
+                            build_error_response(msg)
+                        }
+                        _ => {
+                            state.connection_pool.remove_pending_request(&req_id);
+                            (
+                                axum::http::StatusCode::BAD_GATEWAY,
+                                format!("Unexpected message type: {}", msg.r#type),
+                            )
+                                .into_response()
                         }
                     }
-                    "error" => Err(axum::http::StatusCode::BAD_GATEWAY),
-                    _ => Err(axum::http::StatusCode::BAD_GATEWAY)
                 }
-            } else {
-                Err(axum::http::StatusCode::GATEWAY_TIMEOUT)
+                None => {
+                    state.connection_pool.remove_pending_request(&req_id);
+                    (
+                        axum::http::StatusCode::GATEWAY_TIMEOUT,
+                        "Gateway Timeout: No response from client",
+                    )
+                        .into_response()
+                }
             }
         }
-        _ = timeout => {
-            Err(axum::http::StatusCode::GATEWAY_TIMEOUT)
+        _ = &mut timeout => {
+            state.connection_pool.remove_pending_request(&req_id);
+            (
+                axum::http::StatusCode::GATEWAY_TIMEOUT,
+                "Gateway Timeout: Request timed out",
+            )
+                .into_response()
         }
     }
 }
 
-// 辅助函数
-fn headers_to_json(headers: &HeaderMap) -> serde_json::Value {
+/// 构建 HTTP 响应
+fn build_http_response(msg: WSMessage) -> Response {
+    use axum::http::Response as HttpResponse;
+
+    let status = msg
+        .payload
+        .get("status")
+        .and_then(|v| v.as_u64())
+        .map(|s| s as u16)
+        .unwrap_or(200);
+
+    let body = msg
+        .payload
+        .get("body")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let mut response = HttpResponse::builder().status(status);
+
+    // 设置响应头
+    if let Some(headers) = msg.payload.get("headers") {
+        if let Some(headers_obj) = headers.as_object() {
+            for (key, value) in headers_obj {
+                if let Some(value_str) = value.as_str() {
+                    response = response.header(key, value_str);
+                }
+            }
+        }
+    }
+
+    response.body(body).unwrap().into_response()
+}
+
+/// 构建错误响应
+fn build_error_response(msg: WSMessage) -> Response {
+    let error_msg = msg
+        .payload
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown error from client")
+        .to_string();
+
+    let status = msg
+        .payload
+        .get("status")
+        .and_then(|v| v.as_u64())
+        .map(|s| {
+            axum::http::StatusCode::from_u16(s as u16)
+                .unwrap_or(axum::http::StatusCode::BAD_GATEWAY)
+        })
+        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+
+    (status, error_msg).into_response()
+}
+
+/// 过滤不应转发的 HTTP headers
+fn filter_headers(headers: &HeaderMap) -> serde_json::Value {
     let mut header_map = serde_json::Map::new();
+
     for (key, value) in headers.iter() {
+        let key_str = key.as_str();
+
+        // 过滤掉代理特有的和 HTTP/1.1 逃逸的头
+        if matches!(
+            key_str.to_lowercase().as_str(),
+            "connection"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailers"
+                | "transfer-encoding"
+                | "upgrade"
+                | "host"
+        ) {
+            continue;
+        }
+
         if let Ok(value_str) = value.to_str() {
             header_map.insert(
-                key.to_string(),
+                key_str.to_string(),
                 serde_json::Value::String(value_str.to_string()),
             );
         }
     }
+
     serde_json::Value::Object(header_map)
 }
 
@@ -226,8 +427,8 @@ async fn main() {
     // 构建路由
     let app = Router::new()
         .route("/v1/ws", get(websocket_handler))
-        .route("/v1/models/:model/generate", post(proxy_handler))
-        .route("/", post(proxy_handler))
+        .route("/v1/*path", post(proxy_handler))
+        .route("/*path", post(proxy_handler))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
