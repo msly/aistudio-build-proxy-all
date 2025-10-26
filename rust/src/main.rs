@@ -270,8 +270,19 @@ async fn process_websocket_response(
                                         Some(msg) => match msg.r#type.as_str() {
                                             "stream_chunk" => {
                                                 if let Some(data) = msg.payload.get("data").and_then(|v| v.as_str()) {
+                                                    // JavaScript 客户端发送的数据可能已经包含 "data: " 前缀
+                                                    // 我们需要剥离它，因为 Axum 的 SSE 会自动添加
+                                                    let clean_data = if data.starts_with("data: ") {
+                                                        &data[6..] // 移除 "data: " 前缀
+                                                    } else {
+                                                        data
+                                                    };
+
+                                                    // SSE 不允许 data 字段包含换行符
+                                                    // 将换行符替换为空格，或者压缩 JSON 为单行
+                                                    let sanitized_data = clean_data.replace('\n', " ").replace('\r', "");
                                                     Some((
-                                                        Ok::<_, std::convert::Infallible>(Event::default().data(data)),
+                                                        Ok::<_, std::convert::Infallible>(Event::default().data(sanitized_data)),
                                                         (rx, req_id, state, ended),
                                                     ))
                                                 } else {
