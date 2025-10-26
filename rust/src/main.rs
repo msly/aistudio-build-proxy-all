@@ -130,10 +130,16 @@ async fn handle_socket(
 /// HTTP代理处理器 - 支持流式和非流式响应
 async fn proxy_handler(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     axum::extract::Path(path): axum::extract::Path<String>,
+    headers: HeaderMap,
     body: String,
 ) -> Response {
+    info!(
+        "Received HTTP request: path={}, body_len={}",
+        path,
+        body.len()
+    );
+
     // 认证检查
     let api_key = headers
         .get("x-goog-api-key")
@@ -159,6 +165,8 @@ async fn proxy_handler(
     let user_id = "user-1".to_string();
     let req_id = Uuid::new_v4().to_string();
 
+    info!("Authenticated as user_id={}, req_id={}", user_id, req_id);
+
     // 获取连接
     let connection = match state.connection_pool.get_connection(&user_id).await {
         Some(conn) => conn,
@@ -178,7 +186,12 @@ async fn proxy_handler(
         .register_pending_request(req_id.clone(), tx);
 
     // 构建完整的目标 URL
-    let target_url = format!("https://generativelanguage.googleapis.com{}", path);
+    // 确保 path 以斜杠开头
+    let target_url = if path.starts_with('/') {
+        format!("https://generativelanguage.googleapis.com{}", path)
+    } else {
+        format!("https://generativelanguage.googleapis.com/{}", path)
+    };
 
     // 转换 headers，过滤代理特有的头
     let forwarded_headers = filter_headers(&headers);
@@ -196,6 +209,14 @@ async fn proxy_handler(
     };
 
     // 发送请求
+    info!(
+        "Sending request to WebSocket client: req_id={}, url={}",
+        req_id, target_url
+    );
+    info!(
+        "Request payload: {:?}",
+        serde_json::to_string(&request_message).unwrap()
+    );
     if connection.send_message(request_message).await.is_err() {
         state.connection_pool.remove_pending_request(&req_id);
         return (
@@ -222,10 +243,12 @@ async fn process_websocket_response(
     tokio::pin!(timeout);
 
     // 首先等待第一条消息以确定是流式还是非流式
+    info!("Waiting for response for req_id={}", req_id);
     tokio::select! {
         first_msg = rx.recv() => {
             match first_msg {
                 Some(msg) => {
+                    info!("Received WebSocket message: type={}, req_id={}", msg.r#type, req_id);
                     match msg.r#type.as_str() {
                         "http_response" => {
                             // 非流式响应
@@ -289,6 +312,7 @@ async fn process_websocket_response(
                             Sse::new(stream).into_response()
                         }
                         "error" => {
+                            error!("Client returned error: {:?}", msg.payload);
                             state.connection_pool.remove_pending_request(&req_id);
                             build_error_response(msg)
                         }
@@ -403,9 +427,10 @@ fn filter_headers(headers: &HeaderMap) -> serde_json::Value {
         }
 
         if let Ok(value_str) = value.to_str() {
+            // Go 格式：headers 的值必须是数组，匹配 Go 的 map[string][]string
             header_map.insert(
                 key_str.to_string(),
-                serde_json::Value::String(value_str.to_string()),
+                serde_json::json!([value_str]), // 包装成数组
             );
         }
     }

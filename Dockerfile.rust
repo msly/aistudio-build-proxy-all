@@ -57,7 +57,7 @@ RUN camoufox fetch
 COPY camoufox-py/ .
 
 # 复制 Supervisor 的配置文件
-COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+COPY supervisord.rust.conf /etc/supervisor/conf.d/supervisord.conf
 
 # 容器启动时，运行 Supervisor
 # 它会根据 supervisord.conf 的配置来启动你的 Python 和 Rust 应用
