@@ -1,0 +1,45 @@
+[package]
+name = "aistudio-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Web框架
+tokio = { version = "1.0", features = ["full"] }
+axum = { version = "0.7", features = ["ws", "headers"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# WebSocket支持
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
+
+# HTTP客户端
+reqwest = { version = "0.11", features = ["json", "stream"] }
+hyper = { version = "1.0", features = ["full"] }
+
+# 序列化
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# UUID生成
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+# 异步运行时
+tokio = { version = "1.0", features = ["full"] }
+
+# 错误处理
+anyhow = "1.0"
+thiserror = "1.0"
+
+# 时间处理
+chrono = { version = "0.4", features = ["serde"] }
+
+# 并发安全
+dashmap = "5.5"
+arc-swap = "1.6"
+
+# 环境变量
+dotenv = "0.15"
