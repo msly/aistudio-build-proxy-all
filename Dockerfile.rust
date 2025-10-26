@@ -1,9 +1,9 @@
 # --- Stage 1: Rust Builder ---
-# 使用官方的 Rust 镜像作为构建环境
-FROM rust:1.75-alpine AS builder-rust
+# 使用官方的 Rust 镜像作为构建环境（需要 1.77+ 支持 Cargo.lock v4）
+FROM rust:1.90-alpine AS builder-rust
 
-# 安装必要的构建工具
-RUN apk add --no-cache musl-dev
+# 安装必要的构建工具和 OpenSSL 开发库
+RUN apk add --no-cache musl-dev openssl-dev pkgconfig
 
 # 设置工作目录
 WORKDIR /src
