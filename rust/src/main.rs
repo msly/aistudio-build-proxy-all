@@ -1,11 +1,11 @@
 //! AI Studio Proxy - Rust Implementation
-//! 
+//!
 //! A high-performance WebSocket proxy server for AI Studio Build services
 
+mod auth;
 mod connection;
 mod message;
 mod proxy;
-mod auth;
 
 use axum::{
     extract::{
@@ -13,27 +13,18 @@ use axum::{
         Query, State,
     },
     http::HeaderMap,
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
 use futures_util::{sink::SinkExt, stream::StreamExt};
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::{
-    connection::ConnectionPool,
-    message::WSMessage,
-    proxy::{AppState, handle_proxy_request, handle_streaming_response},
-    auth::authenticate_websocket,
-};
+use crate::{message::WSMessage, proxy::AppState};
 
 // 常量定义
 const WS_PATH: &str = "/v1/ws";
@@ -48,7 +39,7 @@ async fn websocket_handler(
     State(state): State<Arc<AppState>>,
 ) -> Response {
     let auth_token = params.get("auth_token").cloned().unwrap_or_default();
-    
+
     // 简化的认证逻辑
     let user_id = if auth_token == "valid-token-user-1" {
         "user-1".to_string()
@@ -59,27 +50,40 @@ async fn websocket_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, user_id, state))
 }
 
-async fn handle_socket(socket: axum::extract::ws::WebSocket, user_id: String, state: Arc<AppState>) {
+async fn handle_socket(
+    socket: axum::extract::ws::WebSocket,
+    user_id: String,
+    state: Arc<AppState>,
+) {
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<WSMessage>();
-    
+
     // 添加到连接池
-    let connection = state.connection_pool.add_connection(user_id.clone(), tx).await;
-    
+    let connection = state
+        .connection_pool
+        .add_connection(user_id.clone(), tx)
+        .await;
+
     // 启动发送任务
     let connection_clone = connection.clone();
     let state_clone = state.clone();
     let user_id_clone = user_id.clone();
     tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
-            if let Err(e) = sender.send(Message::Text(serde_json::to_string(&message).unwrap())).await {
+            if let Err(e) = sender
+                .send(Message::Text(serde_json::to_string(&message).unwrap()))
+                .await
+            {
                 error!("Failed to send WebSocket message: {}", e);
                 break;
             }
         }
-        
+
         // 清理连接
-        state_clone.connection_pool.remove_connection(&user_id_clone, &connection_clone.user_id).await;
+        state_clone
+            .connection_pool
+            .remove_connection(&user_id_clone, &connection_clone.user_id)
+            .await;
     });
 
     // 处理接收的消息
@@ -94,10 +98,13 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, user_id: String, st
                                 r#type: "pong".to_string(),
                                 payload: serde_json::Value::Null,
                             };
-                            let _ = connection.sender.send(pong).await;
+                            let _ = connection.sender.send(pong);
                         }
-                        "http_response" | "stream_start" | "stream_chunk" | "stream_end" | "error" => {
-                            if let Some(sender) = state.connection_pool.pending_requests.get(&ws_message.id) {
+                        "http_response" | "stream_start" | "stream_chunk" | "stream_end"
+                        | "error" => {
+                            if let Some(sender) =
+                                state.connection_pool.pending_requests.get(&ws_message.id)
+                            {
                                 let _ = sender.send(ws_message);
                             }
                         }
@@ -122,14 +129,12 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, user_id: String, st
 
 /// HTTP代理处理器
 async fn proxy_handler(
+    State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: String,
-    State(state): State<Arc<AppState>>,
 ) -> Result<String, axum::http::StatusCode> {
     // 认证检查
-    let api_key = headers
-        .get("x-goog-api-key")
-        .and_then(|h| h.to_str().ok());
+    let api_key = headers.get("x-goog-api-key").and_then(|h| h.to_str().ok());
 
     if api_key != Some(&state.auth_api_key) {
         return Err(axum::http::StatusCode::UNAUTHORIZED);
@@ -146,7 +151,9 @@ async fn proxy_handler(
 
     // 创建响应通道
     let (tx, mut rx) = mpsc::unbounded_channel::<WSMessage>();
-    state.connection_pool.register_pending_request(req_id.clone(), tx);
+    state
+        .connection_pool
+        .register_pending_request(req_id.clone(), tx);
 
     // 构建请求消息
     let request_message = WSMessage {
@@ -198,7 +205,7 @@ fn headers_to_json(headers: &HeaderMap) -> serde_json::Value {
         if let Ok(value_str) = value.to_str() {
             header_map.insert(
                 key.to_string(),
-                serde_json::Value::String(value_str.to_string())
+                serde_json::Value::String(value_str.to_string()),
             );
         }
     }
@@ -211,8 +218,8 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     // 从环境变量获取API密钥
-    let auth_api_key = std::env::var("AUTH_API_KEY")
-        .unwrap_or_else(|_| "your_set_api_key_here".to_string());
+    let auth_api_key =
+        std::env::var("AUTH_API_KEY").unwrap_or_else(|_| "your_set_api_key_here".to_string());
 
     let state = Arc::new(AppState::new(auth_api_key));
 
@@ -225,9 +232,14 @@ async fn main() {
         .with_state(state);
 
     info!("Starting server on {}", PROXY_LISTEN_ADDR);
-    info!("WebSocket endpoint available at ws://{}{}", PROXY_LISTEN_ADDR, WS_PATH);
+    info!(
+        "WebSocket endpoint available at ws://{}{}",
+        PROXY_LISTEN_ADDR, WS_PATH
+    );
     info!("HTTP proxy available at http://{}/", PROXY_LISTEN_ADDR);
 
-    let listener = tokio::net::TcpListener::bind(PROXY_LISTEN_ADDR).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(PROXY_LISTEN_ADDR)
+        .await
+        .unwrap();
     axum::serve(listener, app).await.unwrap();
 }

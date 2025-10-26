@@ -4,7 +4,7 @@ use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 use tracing::{info, warn};
 
 /// Authentication result
@@ -17,15 +17,15 @@ pub struct AuthResult {
 /// WebSocket authentication
 pub async fn authenticate_websocket(
     query: Query<HashMap<String, String>>,
-    state: State<Arc<AppState>>,
+    _state: State<Arc<AppState>>,
 ) -> Result<AuthResult, StatusCode> {
     let auth_token = query.get("auth_token").cloned().unwrap_or_default();
-    
+
     if auth_token.is_empty() {
         warn!("WebSocket authentication failed: missing auth_token");
         return Err(StatusCode::UNAUTHORIZED);
     }
-    
+
     // Simple token validation (in production, use proper JWT validation)
     if auth_token == "valid-token-user-1" {
         info!("WebSocket authenticated for user-1");
@@ -45,15 +45,13 @@ pub async fn authenticate_http_request(
     state: State<Arc<AppState>>,
 ) -> Result<AuthResult, StatusCode> {
     // Check for API key in headers
-    let api_key = headers
-        .get("x-goog-api-key")
-        .and_then(|h| h.to_str().ok());
-    
+    let api_key = headers.get("x-goog-api-key").and_then(|h| h.to_str().ok());
+
     if api_key != Some(&state.auth_api_key) {
         warn!("HTTP authentication failed: invalid API key");
         return Err(StatusCode::UNAUTHORIZED);
     }
-    
+
     info!("HTTP request authenticated for user-1");
     Ok(AuthResult {
         user_id: "user-1".to_string(),
@@ -66,7 +64,7 @@ pub fn validate_jwt(token: &str) -> Result<String, String> {
     if token.is_empty() {
         return Err("Missing auth_token".to_string());
     }
-    
+
     // In production, implement proper JWT validation
     if token == "valid-token-user-1" {
         Ok("user-1".to_string())

@@ -4,7 +4,7 @@ use crate::message::WSMessage;
 use dashmap::DashMap;
 use std::{
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime},
 };
 use tokio::sync::{mpsc, RwLock};
 
@@ -26,12 +26,17 @@ impl UserConnection {
     }
 
     /// Send a message to this connection
-    pub async fn send_message(&self, message: WSMessage) -> Result<(), mpsc::error::SendError<WSMessage>> {
-        self.sender.send(message).map_err(|_| mpsc::error::SendError(WSMessage {
-            id: "".to_string(),
-            r#type: "error".to_string(),
-            payload: serde_json::Value::Null,
-        }))
+    pub async fn send_message(
+        &self,
+        message: WSMessage,
+    ) -> Result<(), mpsc::error::SendError<WSMessage>> {
+        self.sender.send(message).map_err(|_| {
+            mpsc::error::SendError(WSMessage {
+                id: "".to_string(),
+                r#type: "error".to_string(),
+                payload: serde_json::Value::Null,
+            })
+        })
     }
 
     /// Check if connection is still active (within timeout)
@@ -111,22 +116,29 @@ impl ConnectionPool {
     }
 
     /// Add a new connection to the pool
-    pub async fn add_connection(&self, user_id: String, sender: mpsc::UnboundedSender<WSMessage>) -> Arc<UserConnection> {
+    pub async fn add_connection(
+        &self,
+        user_id: String,
+        sender: mpsc::UnboundedSender<WSMessage>,
+    ) -> Arc<UserConnection> {
         let connection = Arc::new(UserConnection::new(user_id.clone(), sender));
-        
-        let user_connections = self.users
+
+        let user_connections = self
+            .users
             .entry(user_id.clone())
             .or_insert_with(|| Arc::new(RwLock::new(UserConnections::new())));
-        
+
         {
             let mut connections = user_connections.write().await;
             connections.add_connection(connection.clone());
         }
-        
-        tracing::info!("WebSocket connected: UserID={}, Total connections: {}", 
-              user_id, 
-              user_connections.read().await.connections.len());
-        
+
+        tracing::info!(
+            "WebSocket connected: UserID={}, Total connections: {}",
+            user_id,
+            user_connections.read().await.connections.len()
+        );
+
         connection
     }
 
@@ -135,7 +147,7 @@ impl ConnectionPool {
         if let Some(user_connections) = self.users.get(user_id) {
             let mut connections = user_connections.write().await;
             connections.remove_connection(connection_id);
-            
+
             if connections.is_empty() {
                 self.users.remove(user_id);
             }
@@ -153,7 +165,11 @@ impl ConnectionPool {
     }
 
     /// Register a pending request
-    pub fn register_pending_request(&self, request_id: String, sender: mpsc::UnboundedSender<WSMessage>) {
+    pub fn register_pending_request(
+        &self,
+        request_id: String,
+        sender: mpsc::UnboundedSender<WSMessage>,
+    ) {
         self.pending_requests.insert(request_id, sender);
     }
 
@@ -164,8 +180,8 @@ impl ConnectionPool {
 
     /// Send response to pending request
     pub fn send_response(&self, request_id: &str, message: WSMessage) -> bool {
-        if let Some((_, sender)) = self.pending_requests.get(request_id) {
-            sender.send(message).is_ok()
+        if let Some(sender) = self.pending_requests.get(request_id) {
+            sender.value().send(message).is_ok()
         } else {
             false
         }
@@ -174,16 +190,16 @@ impl ConnectionPool {
     /// Clean up inactive connections
     pub async fn cleanup_inactive(&self, timeout: Duration) {
         let mut to_remove = Vec::new();
-        
+
         for entry in self.users.iter() {
             let mut connections = entry.value().write().await;
             connections.cleanup_inactive(timeout);
-            
+
             if connections.is_empty() {
                 to_remove.push(entry.key().clone());
             }
         }
-        
+
         for user_id in to_remove {
             self.users.remove(&user_id);
         }
@@ -193,13 +209,13 @@ impl ConnectionPool {
     pub async fn get_stats(&self) -> ConnectionStats {
         let mut total_connections = 0;
         let mut total_users = 0;
-        
+
         for entry in self.users.iter() {
             let connections = entry.value().read().await;
             total_connections += connections.len();
             total_users += 1;
         }
-        
+
         ConnectionStats {
             total_connections,
             total_users,
