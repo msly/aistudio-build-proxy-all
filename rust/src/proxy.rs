@@ -17,12 +17,13 @@ use uuid::Uuid;
 pub async fn handle_proxy_request(
     method: String,
     path: String,
+    query_string: Option<String>,
     headers: HeaderMap,
     body: String,
     state: State<Arc<AppState>>,
 ) -> Result<Response<String>, StatusCode> {
     // Authenticate request
-    let user_id = authenticate_request(&headers)?;
+    let user_id = authenticate_request(&headers, &query_string)?;
 
     // Get connection from pool
     let connection = state
@@ -121,12 +122,13 @@ fn handle_websocket_response(msg: WSMessage) -> Result<Response<String>, StatusC
 pub async fn handle_streaming_response(
     method: String,
     path: String,
+    query_string: Option<String>,
     headers: HeaderMap,
     body: String,
     state: State<Arc<AppState>>,
 ) -> Result<Sse<impl Stream<Item = Result<axum::response::sse::Event, Infallible>>>, StatusCode> {
     // Authenticate request
-    let user_id = authenticate_request(&headers)?;
+    let user_id = authenticate_request(&headers, &query_string)?;
 
     // Get connection from pool
     let connection = state
@@ -241,20 +243,33 @@ fn headers_to_map(headers: &HeaderMap) -> HashMap<String, String> {
 }
 
 /// Authenticate HTTP request
-fn authenticate_request(headers: &HeaderMap) -> Result<String, StatusCode> {
-    // Check for API key in headers
-    let api_key = headers.get("x-goog-api-key").and_then(|h| h.to_str().ok());
-
-    // Check for API key in query parameters (would need to be passed separately)
-    // For now, we'll use a simple hardcoded check
-    let expected_key =
-        std::env::var("AUTH_API_KEY").unwrap_or_else(|_| "your_set_api_key_here".to_string());
-
-    if api_key == Some(&expected_key) {
-        Ok("user-1".to_string())
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
+pub fn authenticate_request(headers: &HeaderMap, query_string: &Option<String>) -> Result<String, StatusCode> {
+    // Check for API key in headers first
+    if let Some(api_key) = headers.get("x-goog-api-key").and_then(|h| h.to_str().ok()) {
+        let expected_key =
+            std::env::var("AUTH_API_KEY").unwrap_or_else(|_| "your_set_api_key_here".to_string());
+        if api_key == expected_key {
+            return Ok("user-1".to_string());
+        }
     }
+
+    // Check for API key in query string
+    if let Some(query) = query_string {
+        // Parse query parameters to find 'key' parameter
+        for param in query.split('&') {
+            if let Some((key, value)) = param.split_once('=') {
+                if key == "key" {
+                    let expected_key =
+                        std::env::var("AUTH_API_KEY").unwrap_or_else(|_| "your_set_api_key_here".to_string());
+                    if value == expected_key {
+                        return Ok("user-1".to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    Err(StatusCode::UNAUTHORIZED)
 }
 
 /// Application state

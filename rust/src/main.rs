@@ -29,7 +29,6 @@ use crate::{message::WSMessage, proxy::AppState};
 // 常量定义
 const WS_PATH: &str = "/v1/ws";
 const PROXY_LISTEN_ADDR: &str = "0.0.0.0:5345";
-const WS_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const PROXY_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// WebSocket处理器
@@ -131,6 +130,7 @@ async fn handle_socket(
 async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(path): axum::extract::Path<String>,
+    axum::extract::Query(query_params): axum::extract::Query<HashMap<String, String>>,
     headers: HeaderMap,
     body: String,
 ) -> Response {
@@ -140,29 +140,30 @@ async fn proxy_handler(
         body.len()
     );
 
-    // 认证检查
-    let api_key = headers
-        .get("x-goog-api-key")
-        .and_then(|h| h.to_str().ok())
-        .or_else(|| {
-            // 也检查 query 参数
-            headers.get("x-original-uri").and_then(|uri| {
-                uri.to_str()
-                    .ok()
-                    .and_then(|s| s.split("key=").nth(1))
-                    .and_then(|s| s.split('&').next())
-            })
-        });
-
-    if api_key != Some(&state.auth_api_key) {
-        return (
-            axum::http::StatusCode::UNAUTHORIZED,
-            "Unauthorized: Invalid or missing API key",
+    // Get query string for API key checking
+    let query_string = if query_params.is_empty() {
+        None
+    } else {
+        Some(
+            query_params
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join("&"),
         )
-            .into_response();
-    }
+    };
 
-    let user_id = "user-1".to_string();
+    // 认证检查 - 更新为直接使用 authenticate_request 函数
+    let user_id = match crate::proxy::authenticate_request(&headers, &query_string) {
+        Ok(user_id) => user_id,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                "Unauthorized: Invalid or missing API key",
+            )
+                .into_response();
+        }
+    };
     let req_id = Uuid::new_v4().to_string();
 
     info!("Authenticated as user_id={}, req_id={}", user_id, req_id);
@@ -260,11 +261,8 @@ async fn process_websocket_response(
                             info!("Starting SSE stream for request {}", req_id);
 
                             let stream = stream::unfold(
-                                (rx, req_id.clone(), state.clone(), false),
-                                |(mut rx, req_id, state, mut ended)| async move {
-                                    if ended {
-                                        return None;
-                                    }
+                                (rx, req_id.clone(), state.clone()),
+                                |(mut rx, req_id, state)| async move {
 
                                     match rx.recv().await {
                                         Some(msg) => match msg.r#type.as_str() {
@@ -283,19 +281,18 @@ async fn process_websocket_response(
                                                     let sanitized_data = clean_data.replace('\n', " ").replace('\r', "");
                                                     Some((
                                                         Ok::<_, std::convert::Infallible>(Event::default().data(sanitized_data)),
-                                                        (rx, req_id, state, ended),
+                                                        (rx, req_id, state),
                                                     ))
                                                 } else {
                                                     Some((
-                                                        Ok(Event::default().data("")),
-                                                        (rx, req_id, state, ended),
+                                                        Ok::<_, std::convert::Infallible>(Event::default().data("")),
+                                                        (rx, req_id, state),
                                                     ))
                                                 }
                                             }
                                             "stream_end" => {
                                                 info!("Stream ended for request {}", req_id);
                                                 state.connection_pool.remove_pending_request(&req_id);
-                                                ended = true;
                                                 None
                                             }
                                             "error" => {
@@ -306,8 +303,8 @@ async fn process_websocket_response(
                                             _ => {
                                                 warn!("Unexpected message type in stream: {}", msg.r#type);
                                                 Some((
-                                                    Ok(Event::default().data("")),
-                                                    (rx, req_id, state, ended),
+                                                    Ok::<_, std::convert::Infallible>(Event::default().data("")),
+                                                    (rx, req_id, state),
                                                 ))
                                             }
                                         },

@@ -11,4 +11,4 @@ pub mod auth;
 pub use connection::*;
 pub use message::*;
 pub use proxy::*;
-pub use auth::*;
+// auth module re-exports moved to avoid conflicts - AppState is defined in proxy module
